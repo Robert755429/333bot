@@ -1,4 +1,3 @@
-
 import { env } from 'process';
 env.PORT = '3011';
 import dns from 'dns';
@@ -346,21 +345,317 @@ global.lidCache = new NodeCache({
 });
 
 
-/**
- * ============================================================================
- * FIX BOT/UTENTE CONFUSI (LID risolto sul numero del bot)
- * ----------------------------------------------------------------------------
- * Problema: se anche una sola volta viene salvata in lidCache un'associazione
- * LID_di_un_utente -> numero_del_bot (per un bug di Baileys, un sync di
- * contatti, o una scrittura interna non filtrata), da quel momento in poi
- * decodeJid() per quel LID restituisce il numero del bot, e ogni messaggio
- * di quell'utente viene trattato come se lo avesse scritto il bot stesso
- * (vedi log "bot: 39 375 694 7955 / utente: 39 375 694 7955").
- *
- * Fix: teniamo un set delle cifre "proprie" del bot (numero + eventuale @lid
- * del bot) e blocchiamo qualunque scrittura in lidCache che associ un LID
- * DIVERSO dal proprio a quelle cifre. Il set viene popolato/aggiornato non
- * appena la connessione si apre (vedi connectionUpdate più sotto).
+global.__ownBotDigits = new Set();
+global.__ownBotLid = null;
+
+function _updateOwnBotIdentity() {
+    try {
+        const rawId = global.conn?.user?.id || global.conn?.user?.jid || '';
+        const ownDigits = String(rawId).split(':')[0].replace(/\D/g, '');
+        if (ownDigits.length >= 8 && ownDigits.length <= 15) {
+            global.__ownBotDigits.add(ownDigits);
+        }
+    } catch {}
+    try {
+        if (global.conn?.user?.lid) {
+            global.__ownBotLid = String(global.conn.user.lid).replace(/:\d+@/, '@');
+        }
+    } catch {}
+    
+    try {
+        const cache = global.lidCache;
+        if (cache && typeof cache.keys === 'function') {
+            for (const k of cache.keys()) {
+                if (!k || !String(k).endsWith('@lid')) continue;
+                if (global.__ownBotLid && String(k) === global.__ownBotLid) continue;
+                const v = cache.get(k);
+                if (!v) continue;
+                const vd = String(v).split('@')[0].replace(/\D/g, '');
+                if (global.__ownBotDigits.has(vd)) {
+                    try { cache.del(k); console.warn('[lidCache] Purgato mapping avvelenato:', k, '->', v); } catch {}
+                }
+            }
+        }
+        if (global.lidToRealJid && typeof global.lidToRealJid.entries === 'function') {
+            for (const [k, v] of [...global.lidToRealJid.entries()]) {
+                if (!k || !String(k).endsWith('@lid')) continue;
+                if (global.__ownBotLid && String(k) === global.__ownBotLid) continue;
+                const vd = String(v || '').split('@')[0].replace(/\D/g, '');
+                if (global.__ownBotDigits.has(vd)) {
+                    try { global.lidToRealJid.delete(k); } catch {}
+                }
+            }
+        }
+    } catch {}
+}
+global.updateOwnBotIdentity = _updateOwnBotIdentity;
+
+
+function _isFakePhoneFromLid(pn) {
+    if (!pn || typeof pn !== 'string') return true;
+    const d = pn.includes('@') ? pn.split('@')[0].replace(/:\d+$/, '') : pn;
+    const digits = String(d).replace(/\D/g, '');
+    if (!digits || digits.length < 8) return true;
+    if (digits.length > 15) return true;
+    if (digits.length >= 14 && (digits.startsWith('120363') || digits.startsWith('20363') || digits.startsWith('90426'))) return true;
+    return false;
+}
+
+const _origLidSet = global.lidCache.set.bind(global.lidCache);
+global.lidCache.set = (lid, pn, ttl) => {
+    if (!lid || !pn) return false;
+    const nLid = String(lid);
+    let nPn = String(pn);
+    if (!nPn.includes('@')) nPn = nPn.replace(/\D/g, '') + '@s.whatsapp.net';
+    const digits = nPn.split('@')[0].replace(/\D/g, '');
+
+    if (digits.length > 15 || digits.length < 8) return false;
+    if (digits.length >= 14 && (digits.startsWith('120363') || digits.startsWith('20363') || digits.startsWith('90426'))) return false;
+
+    if (global.__ownBotDigits.has(digits) && nLid !== global.__ownBotLid) {
+        try {
+            console.warn(`[lidCache] BLOCCATO tentativo di associare ${nLid} al numero del bot (${digits})`);
+        } catch {}
+        return false;
+    }
+
+    try { global.jidCache.del(nLid); } catch {}
+    try { global.jidCache.set(nLid, nPn); } catch {}
+    return _origLidSet(nLid, nPn, ttl);
+};
+
+
+const logger = pino({
+    level: 'silent',
+    redact: {
+        paths: ['creds.*', 'auth.*', 'account.*', 'password', 'token', '*.secret'],
+        censor: '***'
+    },
+    timestamp: () => `,"time":"${new Date().toJSON()}"`
+});
+
+global.antiBan = makeAntiBanSystem(logger);
+global.crashPrevention = makeCrashPreventionSystem(logger);
+global.rateLimiter = makeAdvancedRateLimiter({ tokensPerSecond: 4, enableAdaptive: true });
+global.metrics = makeMetricsSystem(logger);
+global.errorHandler = makeCentralizedErrorHandler(logger);
+
+global.crashPrevention.registerRecoveryStrategy('high_memory', async () => {
+    if (global.gc) global.gc();
+});
+global.crashPrevention.onExit(async () => {
+    try { await global.conn?.end(); } catch {}
+});
+
+global.conns = [];
+global.creds = 'creds.json';
+global.store = {
+    bind: (conn) => {
+        if (!global.store.messages) global.store.messages = {};
+        if (conn && !conn.messages) conn.messages = global.store.messages;
+        return storeHelper.bind(conn);
+    },
+    loadMessage: storeHelper.loadMessage,
+    getMessage: storeHelper.getMessage,
+    saveMessage: storeHelper.saveMessage,
+    messages: {},
+};
+
+
+const {
+    state,
+    saveCreds
+} = await useMultiFileAuthState(global.authFile);
+const msgRetryCounterCache = new NodeCache();
+const {
+    version
+} = await fetchLatestBaileysVersion();
+
+
+const hasExistingSession = existsSync(`./${global.authFile}/creds.json`);
+let methodCodeQR = process.argv.includes('qr');
+let methodCode = process.argv.includes('code') || global.pairingCode || global.methodCode;
+
+// --- INTEGRAZIONE NUMERO DA CONFIG.JS ---
+global.botNumberCode = global.botNumberCode || global.phoneNumberBot || global.pairingNumber || '393887347002';
+let phoneNumber = global.botNumberCode;
+// ---------------------------------------
+
+let pairingMode = methodCodeQR ? 'qr' : 'code';
+let pairingCodeRequested = false;
+let lastConnectionStateLogged = null;
+let successfulConnectionLogged = false;
+
+global.isLogoPrinted = false;
+global.qrGenerated = false;
+global.connectionMessagesPrinted = {};
+
+
+function logSystem(message, color = 'cyanBright') {
+    (chalk[color] || chalk.cyanBright)(`〔 333 BOT 〕 ${message}`);
+    console.log((chalk[color] || chalk.cyanBright)(`〔 333 BOT 〕 ${message}`));
+}
+
+function normalizePhoneNumberInput(value = '') {
+    const digits = value.replace(/\D/g, '');
+    if (digits.length < 8 || digits.length > 15) return null;
+    return digits;
+}
+
+function generateRandomCode(length = 8) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let r = '';
+    for (let i = 0; i < length; i++)
+        r += chars[Math.floor(Math.random() * chars.length)];
+    return r;
+}
+
+function formatPairingCode(code = '') {
+    return code?.match(/.{1,4}/g)?.join('-')?.toUpperCase() ?? code;
+}
+
+function getConnectionLabel() {
+    const user = global.conn?.user;
+    if (!user) return 'account sconosciuto';
+    const id = String(user.id || '').split(':')[0];
+    const name = user.name || user.verifiedName || 'Bot';
+    return `${name} (${id || 'jid sconosciuto'})`;
+}
+
+function logConnectionState(state, color = 'cyanBright') {
+    if (!state || lastConnectionStateLogged === state) return;
+    lastConnectionStateLogged = state;
+    logSystem(state, color);
+}
+
+
+function redefineConsoleMethod(methodName, filterStrings) {
+    const orig = console[methodName];
+    console[methodName] = function(...args) {
+        if (typeof args[0] === 'string' &&
+            filterStrings.some(f => args[0].includes(Buffer.from(f, 'base64').toString()))) {
+            return;
+        }
+        orig.apply(console, args);
+    };
+}
+
+const filterStrings = [
+    'Q2xvc2luZyBzdGFsZSBvcGVu',
+    'Q2xvc2luZyBvcGVuIHNlc3Npb24=',
+    'RmFpbGVkIHRvIGRlY3J5cHQ=',
+    'U2Vzc2lvbiBlcnJvcg==',
+    'RXJyb3I6IEJhZCBNQUM=',
+    'RGVjcnlwdGVkIG1lc3NhZ2U='
+];
+console.info = () => {};
+console.debug = () => {};
+['log', 'warn', 'error'].forEach(m => redefineConsoleMethod(m, filterStrings));
+
+
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true
+});
+
+const question = (t) => {
+    rl.clearLine(rl.input, 0);
+    return new Promise(resolve =>
+        rl.question(t, (r) => {
+            rl.clearLine(rl.input, 0);
+            resolve(r.trim());
+        })
+    );
+};
+
+async function requestPairingCodeFlow() {
+    if (pairingCodeRequested || global.conn?.authState?.creds?.registered) return;
+    pairingCodeRequested = true;
+    try {
+        let normalizedNumber;
+        if (phoneNumber) {
+            normalizedNumber = normalizePhoneNumberInput(phoneNumber);
+            if (!normalizedNumber) throw new Error('Il numero configurato non è valido');
+            phoneNumber = `+${normalizedNumber}`;
+        } else {
+            const normalized = normalizePhoneNumberInput('393887347002');
+            normalizedNumber = normalized;
+            phoneNumber = `+${normalizedNumber}`;
+        }
+        logSystem(`Avvio pairing code automatico per ${phoneNumber}...`, 'blueBright');
+        const raw = await global.conn.requestPairingCode(normalizedNumber, generateRandomCode());
+        const formatted = formatPairingCode(raw);
+        console.log(
+            chalk.bold.white(chalk.bgBlueBright('꒰🩸꒱ ◦•≫ CODICE DI COLLEGAMENTO:')),
+            chalk.bold.white(formatted)
+        );
+        logSystem('Inserisci il codice su WhatsApp › Dispositivi collegati › Collega un dispositivo.', 'greenBright');
+    } catch (err) {
+        pairingCodeRequested = false;
+        logSystem(`Impossibile generare il pairing code: ${err.message}`, 'redBright');
+    }
+}
+
+if (hasExistingSession)
+    logSystem(`Sessione trovata in ${global.authFile}. Avvio con credenziali esistenti.`, 'whiteBright');
+else if (pairingMode === 'qr')
+    logSystem('Modalità pairing: QR code.', 'whiteBright');
+else
+    logSystem('Modalità pairing: codice a 8 caratteri.', 'whiteBright');
+
+
+async function resetGroupSenderDistribution(groupJid) {
+    if (!groupJid || !String(groupJid).endsWith('@g.us')) {
+        return { ok: false, reason: 'serve un JID di gruppo (@g.us)' };
+    }
+    let clearedMemory = 0;
+    let clearedKeys = 0;
+    try {
+        if (global.conn?.authState?.keys?.set) {
+            await global.conn.authState.keys.set({ 'sender-key-memory': { [groupJid]: null } });
+            clearedMemory = 1;
+        }
+    } catch (e) {
+        return { ok: false, reason: e?.message || String(e) };
+    }
+    
+    try {
+        const authDir = path.join(process.cwd(), global.authFile || '333BotSession');
+        if (existsSync(authDir)) {
+            const prefix = 'sender-key-';
+            for (const entry of readdirSync(authDir)) {
+                if (!entry.startsWith(prefix)) continue;
+                if (entry.includes('sender-key-memory') || entry.includes(String(groupJid).split('@')[0])) {
+                    try {
+                        unlinkSync(path.join(authDir, entry));
+                        clearedKeys++;
+                    } catch {}
+                }
+            }
+        }
+    } catch {}
+    
+    try { global.groupCache?.del?.(groupJid); } catch {}
+    try { global.groupCache?.delete?.(groupJid); } catch {}
+    return { ok: true, clearedMemory, clearedKeys };
+}
+global.resetGroupSenderDistribution = resetGroupSenderDistribution;
+
+
+const connectionOptions = {
+    logger,
+    printQRInTerminal: pairingMode === 'qr',
+    mobile: false,
+    auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    browser: pairingMode === 'qr' ? ['Desktop', 'Chrome', '20.0.04'] : ['Ubuntu', 'Chrome', '20.0.04'],
+    version,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: true,
+  one si apre (vedi connectionUpdate più sotto).
  * ============================================================================
  */
 global.__ownBotDigits = new Set();
